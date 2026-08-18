@@ -3,7 +3,8 @@
 **Game:** GUNZ: The Duel (Steam / Masang / Ludenus) — client build `1.0.0.290`, launcher version `1.3.2`
 **Scope:** the TCP **match server** protocol on port `:6000` (protocol version **58**), **and** the
 peer-to-peer **UDP** mesh that carries in-game movement / aim / fire (see §8).
-**Source:** one full live session, decoded byte-exact. See [`CORPUS_master_s52.txt`](CORPUS_master_s52.txt) for the raw hexdumps + full wire timeline this document summarizes.
+**Source:** live sessions decoded byte-exact. See [`CORPUS_master_s52.txt`](CORPUS_master_s52.txt) for the
+raw hexdumps + full wire timeline this document summarizes.
 
 > **What this is for.** Developing tools for Steam GunZ. It documents how the client and the match
 > server talk on `:6000` — the wire framing, crypto, and command set — so you can build things that
@@ -106,7 +107,7 @@ from this spec in a few dozen lines:
 | 1717 | 0x06b5 | MC_MATCH_REQUEST_CHARINFO_DETAIL | C2S | 21..24 | ask another player's detailed char info |
 | 1718 | 0x06b6 | MC_MATCH_RESPONSE_CHARINFO_DETAIL | S2C | 265 | detailed char info reply |
 | 1719 | 0x06b7 | MC_MATCH_REQUEST_ACCOUNT_CHARINFO | C2S | 5 | ask for a slot's char info (param: slot) |
-| 1720 | 0x06b8 | MC_MATCH_RESPONSE_ACCOUNT_CHARINFO | S2C | 559 | char detail (542-byte record; top-right name source) |
+| 1720 | 0x06b8 | MC_MATCH_RESPONSE_ACCOUNT_CHARINFO | S2C | 559 | char detail (542-byte record). NB: the **top-right banner** name/Lv/EXP is **not** this — it's the EOS/account display-name from the auth shim (`game_info.json`), not the match server |
 | 1803 | 0x070b | MC_MATCH_REQUEST_MY_SIMPLE_CHARINFO | C2S | 12 | quick self char summary |
 | 1804 | 0x070c | MC_MATCH_RESPONSE_MY_SIMPLE_CHARINFO | S2C | 61 | self summary reply |
 | 1722 | 0x06ba | *(UNIDENTIFIED)* | S2C | 16 | post-select notify |
@@ -117,22 +118,40 @@ from this spec in a few dozen lines:
 **Char-list order:** `1701` → `1702`. **Select:** `1703` → `1704` (+ `1719`→`1720` for the detail).
 **Create:** `1711` → `1712` → client re-lists (`1701`→`1702`).
 
-### Decoded structure — `1702` char-list record (46 bytes each)
-BlobArray payload = `u32 elementSize=46 | u32 elementCount | record[0] | record[1] | ...`
+### Decoded structure — `1702` char-list record (46 bytes each) — byte-exact, 3-char capture
+BlobArray payload = `u32 payloadLen | u32 elementSize=46 | u32 elementCount | record[0] | record[1] | ...`
+(`payloadLen = 8 + count*46`). Each 46-byte record:
 ```
 +0x00  u32   characterId
 +0x04  char  name[32]        (CP949, NUL-padded, ≤31 bytes)
-+0x24  u8    slotIndex
++0x24  u8    slotIndex       (0,1,2… = bottom-bar order)
 +0x25  u8    level
-+0x26  byte  reserved[8]     (all-zero = active char)
++0x26  u32   charNum         (secondary id; 0 on empty slot)
++0x2A  byte  reserved[4]
 ```
+Real example (account "Wyrelade"): 3 records — `Wyrelade` (slot 0, lvl 8) · `StrikeGZ` (slot 1, lvl 1) ·
+`test5` (slot 2, lvl 1). `elementCount = 3`.
 
-### Decoded structure — `1720` / `1704` char detail (542-byte record head)
+### Decoded structure — `1720` / `1704` char detail (542-byte record) — byte-exact
+`1720 RESPONSE_ACCOUNT_CHARINFO` params = `[u32 ~550][u32 542][u32 count=1][542-byte record]`.
+`1704 RESPONSE_SELECT_CHAR` params = `[u32 result=0][u32 550][u32 542][u32 1][542-byte record]` (same record,
+prefixed with the result word). Record head:
 ```
 +0x00 name[32] | +0x20 clanName[16] | +0x30 i32 clanGrade | +0x34 u16 clanContribution |
 +0x36 u8 slotIndex | +0x37 u16 level | +0x39 u8 sex | +0x3A u8 hair | +0x3B u8 face |
-+0x3C u32 experience | +0x40 u32 bounty | 0x44.. stats / items / currencies / region (zero-fill)
++0x3C u32 experience | +0x40 u32 bounty (= DB Character.BP / the "BT" currency) |
 ```
+Deeper in the SAME record (our packer historically **zeroes** these — they must be filled for appearance +
+select-commit):
+```
+≈+0x7C u32  equippedItemID[12]   (one per MMCIP equip slot — the appearance ids; e.g. 0x2f4d63, 0x2f7479,
+                                  0x2fc2a1, 0x2f9bc7, 0x2fe9cf, 0x30d400, 0x30d401, 0x1e8480, 0x1f6ee0,
+                                  0x1fe414, 0x2191c3, 0x2191c4)
+≈+0xD8 u32  colorOrClanMuid[3]   (e.g. 0x5d6241, 0x5d1423, 0x5d3b31)
+```
+`1704` additionally carries, after the record, an **equipped-instance MUID array** — the *instance* ids of
+the currently-worn items (e.g. `0x00104f55 / 5a / 5b / 5c`), i.e. the specific stash items that are equipped
+(these instance ids come from the `1832` account list and the `1833` bring-to-char moves).
 
 **Currency map (LIVE-VERIFIED, phase-26 W1).** The retail top bar shows three currencies: **C (Coin)**,
 **ZC**, **BT (Bounty)**.
@@ -154,26 +173,89 @@ BlobArray payload = `u32 elementSize=46 | u32 elementCount | record[0] | record[
 
 | id | hex | name | dir | body | what it does |
 |----|-----|------|-----|------|--------------|
-| 1811 | 0x0713 | MC_MATCH_REQUEST_BUY_ITEM | C2S | 29 | buy an item (item id + duration) |
-| 1812 | 0x0714 | MC_MATCH_RESPONSE_BUY_ITEM | S2C | 12 | buy result (result code + new balance) |
-| 1822 | 0x071e | MC_MATCH_RESPONSE_CHARACTER_ITEMLIST | S2C | 663..1562 | your inventory item list |
-| 1823 | 0x071f | MC_MATCH_REQUEST_EQUIP_ITEM | C2S | 24 | equip an item into a slot |
-| 1824 | 0x0720 | MC_MATCH_RESPONSE_EQUIP_ITEM | S2C | 8 | equip result |
+| 1811 | 0x0713 | MC_MATCH_REQUEST_BUY_ITEM | C2S | 29 | buy an item (shop selector) |
+| 1812 | 0x0714 | MC_MATCH_RESPONSE_BUY_ITEM | S2C | ~1320 | buy result **+ the rebuilt item list bundled in** |
+| 1813 | 0x0715 | MC_MATCH_REQUEST_SELL_ITEM | C2S | 8 | sell an owned item |
+| 1814 | 0x0716 | MC_MATCH_RESPONSE_SELL_ITEM | S2C | 20 | sell result (+ new balance) |
+| 1823 | 0x071f | MC_MATCH_REQUEST_EQUIP_ITEM | C2S | 24 | equip an item instance into a slot |
+| 1824 | 0x0720 | MC_MATCH_RESPONSE_EQUIP_ITEM | S2C | 8 | equip result (new equip state) |
+| 1825 | 0x0721 | MC_MATCH_REQUEST_TAKEOFF_ITEM | C2S | 16 | **unequip** — take an item off a slot |
+| 1826 | 0x0722 | MC_MATCH_RESPONSE_TAKEOFF_ITEM | S2C | 8 | unequip result |
+| 1831 | 0x0727 | MC_MATCH_REQUEST_ACCOUNT_ITEMLIST | C2S | 12 | **"give me my account stash"** (the real Hideout inventory) |
+| 1832 | 0x0728 | MC_MATCH_RESPONSE_ACCOUNT_ITEMLIST | S2C | var (16-B recs) | **account item list** — what the Hideout inventory renders |
+| 1833 | 0x0729 | MC_MATCH_REQUEST_BRING_ACCOUNT_ITEM | C2S | 24 | move an item **stash → character** (makes it worn/usable) |
+| 1836 | 0x072c | MC_MATCH_RESPONSE_BRING_BACK_ACCOUNTITEM | S2C | ~606 | rebuilt char + item detail after the move |
+| 1822 | 0x071e | MC_MATCH_RESPONSE_CHARACTER_ITEMLIST | S2C | 663..1562 | *(alt/legacy)* per-char item list — **NOT** the retail Hideout path (see below) |
 | 21000 | 0x5208 | MC_MATCH_REQUEST_CHAR_QUEST_ITEM_LIST | C2S | 12 | quest-item list request |
 | 21001 | 0x5209 | MC_MATCH_RESPONSE_CHAR_QUEST_ITEM_LIST | S2C | 16 | quest-item list reply |
+| 21002 | 0x520a | MC_MATCH_REQUEST_BUY_QUEST_ITEM | C2S | var | buy a quest item |
+| 21003 | 0x520b | MC_MATCH_RESPONSE_BUY_QUEST_ITEM | S2C | var | buy-quest-item result |
 
-**Buy:** `1811` → `1812`. **Equip:** `1823` → `1824`. Inventory arrives as `1822` (server pushes it
-unsolicited — the client never sends `1821`).
+> **Retail inventory correction (byte-exact from a live retail session).** The Hideout inventory is driven by the
+> **account item list** (`1831`→`1832`) and **bring-to-character** (`1833`→`1836`), *not* by `1822`. On login
+> the client asks `1831`; the server answers `1832` with the account **stash** (16-byte records). To put an
+> item on the character (so it's worn / equippable), the client sends `1833 BRING_ACCOUNT_ITEM` and the
+> server replies `1836` with the rebuilt detail. `1822 RESPONSE_CHARACTER_ITEMLIST` still exists and decodes,
+> but the retail Steam client does **not** use it to fill the Hideout inventory grid — an emulator that only
+> pushes `1822` shows an **empty** inventory. Implement `1831/1832` (+ `1833/1836`) to match retail.
 
-**`1811` REQUEST_BUY_ITEM body (24 params B), 5 real samples decoded as BE u32:**
-`[w0 qty/low][w1 item-token …0101][w2 …02][w3 …02/9602][w4 …03/9603][w5 0]`. w1 is a per-shop-slot token
-(low 2 bytes const `0101`), NOT a raw catalog itemID → mapping slot→itemID needs the retail shop catalog
-(client `system.mrs`). Dev sandbox ignores cost.
-**`1812` RESPONSE_BUY_ITEM (7 params B):** `[u32 result=0][3 echo bytes = 1811 body[4:7]]`. IMPLEMENTED
-(phase-26 W2: raw-blob 1811 → exact 1812 success).
-**`1824` RESPONSE_EQUIP_ITEM (3 params B):** `00 00 00` (result=0). IMPLEMENTED (raw-blob 1823 → 1824).
+**Flows:** inventory `1831`→`1832`; equip `1823`→`1824`; unequip `1825`→`1826`; buy `1811`→`1812`;
+sell `1813`→`1814`; bring-to-char `1833`→`1836`.
 
-**`1822` RESPONSE_CHARACTER_ITEMLIST layout (CRACKED, `phase26_parse1822.py`):**
+### Decoded structure — `1832` RESPONSE_ACCOUNT_ITEMLIST (the real inventory)
+```
+params:
++0x00  u32   lead            (MUID low / flags)
++0x04  u32   payloadLen      (bytes of the blob that follows = 8 + count*16)
++0x08  u32   elementSize=16
++0x0C  u32   count
++0x10  ...   count × 16-byte item record:
+             +0x00 u32 itemInstanceLow   (unique id of this owned item, e.g. 0x0004 2fb6)
+             +0x04 u32 itemID            (retail catalog id, e.g. 0x0f4247, 0x5d145b, 0x5d3b55)
+             +0x08 u32 rentMinPeriod     (0x00080520 = 525600 = UNLIMITED = permanent; smaller = rental)
+             +0x0C u32 count             (stack count, usually 1)
+```
+
+### Decoded structure — `1833` REQUEST_BRING_ACCOUNT_ITEM (stash → char)
+```
++0x00  u64   charMUID        (the selected char handle; low = 0x00079d3b in the capture)
++0x08  u32   itemInstanceLow (which stash item — matches a 1832 record's +0x00)
++0x0C  u32   itemID          (matches that record's itemID)
++0x10  u32   qty             (1)
+```
+Server applies the move, then replies `1836` (rebuilt char/item detail) so the item shows on the character.
+
+### Decoded structure — `1811` REQUEST_BUY_ITEM (25 params B, real)
+```
++0x00  u32   0
++0x04  u32   shopSelector    (e.g. 0x01d905ca — a shop-slot token, NOT a raw catalog itemID)
++0x08  u32   1
++0x0C  u32   2
++0x10  u32   0x22000002      (category/filter word)
++0x14  u32   3
++0x18  u8    0
+```
+`shopSelector` maps to a catalog `itemID` via the retail **`GShop.xml`** `SHOP_ITEM.ID → ITEM_ID` table
+(client `system.mrs`); the match server never sends a shop catalog. Dev sandbox ignores cost.
+
+### Decoded structure — `1812` RESPONSE_BUY_ITEM (~1316 params B, real)
+```
++0x00  u32   result=0
++0x04  u32   echo            (= the 1811 shopSelector)
++0x08  ...   the rebuilt owned-item list (~1300 B) bundled straight into the buy response
+```
+> The buy response is **not** a bare 7-byte ack (the earlier corpus guess) — retail bundles the updated item
+> list into `1812`, so after a purchase the client refreshes inventory from this one response.
+
+### Decoded structure — `1823` / `1825` equip / unequip
+```
+1823 REQUEST_EQUIP_ITEM (20 params):  [u64 charMUID][u32 itemInstanceLow][u32 0][u32 slot]   (equip by instance→slot)
+1824 RESPONSE_EQUIP_ITEM (4 params):  [u32 newEquipState]                                    (e.g. 0x00004e23)
+1825 REQUEST_TAKEOFF_ITEM (12 params):[u64 charMUID][u32 slot]                               (unequip by slot)
+1826 RESPONSE_TAKEOFF_ITEM (4 params):[u32 result=0]
+```
+
+**`1822` RESPONSE_CHARACTER_ITEMLIST layout (alt/legacy path, `phase26_parse1822.py`):**
 `[207-B header][ N × 29-B item record ][16-B trailer]`. Header = `[u32 @0 (varies: 0x44/0x5e/0x6c…)]`
 `[const `00 00 00 b8 00 00 00 08 00 00 00 16` @4]` `[3-B pad]` `[equip-slot MUID table: MMCIP_END(12)`
 `slots × (u32 instLow + u32 instHigh=0), 0=empty]` `[zeros/fields]`. Each 29-B record:
@@ -182,10 +264,7 @@ unsolicited — the client never sends `1821`).
 +0x0C u32 rentMinRemainder (0x80520 = 525600 = RENT_MINUTE_PERIOD_UNLIMITED = PERMANENT; smaller = rental)
 +0x10 u32 fB (0x48 rental / 0 permanent)   +0x14 u32 count   +0x18 u32 expiryTs (0 = permanent)   +0x1C u8 0
 ```
-37 real retail itemIDs mined (weapons/armor): `0x30d401 0x30d400 0x2f9b81 0x2f74a4 0x1e8480 0x602160 …`.
-The 207-B header is a custom hand-packed blob (not a stock BlobArray) — reconstruct/validate it with the
-`gunzemu_gui.py` injector (inject candidate 1822s at the live client, no rebuild) before baking into the
-`ResponseCharacterItemList` MASANG path. That builder is where W3 inventory + equip-persistence land.
+Kept for reference (the record layout is genuine), but the retail Hideout grid reads `1832`, not this.
 
 ---
 
