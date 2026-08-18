@@ -109,7 +109,7 @@ from this spec in a few dozen lines:
 | 1717 | 0x06b5 | MC_MATCH_REQUEST_CHARINFO_DETAIL | C2S | 21..24 | ask another player's detailed char info |
 | 1718 | 0x06b6 | MC_MATCH_RESPONSE_CHARINFO_DETAIL | S2C | 265 | detailed char info reply |
 | 1719 | 0x06b7 | MC_MATCH_REQUEST_ACCOUNT_CHARINFO | C2S | 5 | ask for a slot's char info (param: slot) |
-| 1720 | 0x06b8 | MC_MATCH_RESPONSE_ACCOUNT_CHARINFO | S2C | 559 | char detail (542-byte record). NB: the **top-right banner** name/Lv/EXP is **not** this — it's the EOS/account display-name from the auth shim (`game_info.json`), not the match server |
+| 1720 | 0x06b8 | MC_MATCH_RESPONSE_ACCOUNT_CHARINFO | S2C | 559 | char detail (542-byte record). **Feeds the top-right banner** (name/Lv/EXP) — see the char-switch note below |
 | 1803 | 0x070b | MC_MATCH_REQUEST_MY_SIMPLE_CHARINFO | C2S | 12 | quick self char summary |
 | 1804 | 0x070c | MC_MATCH_RESPONSE_MY_SIMPLE_CHARINFO | S2C | 61 | self summary reply |
 | 1722 | 0x06ba | *(UNIDENTIFIED)* | S2C | 16 | post-select notify |
@@ -180,6 +180,13 @@ select-commit):
 `1704` additionally carries, after the record, an **equipped-instance MUID array** — the *instance* ids of
 the currently-worn items (e.g. `0x00104f55 / 5a / 5b / 5c`), i.e. the specific stash items that are equipped
 (these instance ids come from the `1832` account list and the `1833` bring-to-char moves).
+
+**Top-right banner source (proven).** Switching characters sends `1719 [u8 slotIndex]` → `1720` with that
+slot's 542-record, and the banner's **name + level + EXP** track the switched character exactly (verified
+across 4 chars: slot 0 / lvl 8, slots 1–3 / lvl 1). So the banner is fed by this **542-record** (name @
+`+0x00`, slotIndex @ `+0x37`, level @ `+0x38`, exp @ `+0x3C`) via `1720`/`1704` — **not** by `1804`
+(which carries level/exp/currency but no name) and **not** by any account/EOS display-name. An emulator whose
+542-record is zeroed or mis-framed shows a blank name / Lv.0 banner.
 
 **Currency map (LIVE-VERIFIED, phase-26 W1).** The retail top bar shows three currencies: **C (Coin)**,
 **ZC**, **BT (Bounty)**.
