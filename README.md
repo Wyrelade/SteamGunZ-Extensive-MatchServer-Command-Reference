@@ -102,8 +102,10 @@ from this spec in a few dozen lines:
 | 1702 | 0x06a6 | MC_MATCH_RESPONSE_ACCOUNT_CHARLIST | S2C | 108..154 | the char-list (BlobArray of 46-byte records) |
 | 1703 | 0x06a7 | MC_MATCH_REQUEST_SELECT_CHAR | C2S | 16 | select a character slot |
 | 1704 | 0x06a8 | MC_MATCH_RESPONSE_SELECT_CHAR | S2C | 608 | selected char's full detail (542-byte record) |
-| 1711 | 0x06af | MC_MATCH_REQUEST_CREATE_CHAR | C2S | 41 | create a char (name + appearance) |
-| 1712 | 0x06b0 | MC_MATCH_RESPONSE_CREATE_CHAR | S2C | 17 | create result (slot/result code) |
+| 1711 | 0x06af | MC_MATCH_REQUEST_CREATE_CHAR | C2S | 48 | create a char (name + appearance) |
+| 1712 | 0x06b0 | MC_MATCH_RESPONSE_CREATE_CHAR | S2C | 24 | create result (echoes name) |
+| 1713 | 0x06b1 | MC_MATCH_REQUEST_DELETE_CHAR | C2S | 25 | delete a char (confirm by typed name) |
+| 1714 | 0x06b2 | MC_MATCH_RESPONSE_DELETE_CHAR | S2C | 12 | delete result |
 | 1717 | 0x06b5 | MC_MATCH_REQUEST_CHARINFO_DETAIL | C2S | 21..24 | ask another player's detailed char info |
 | 1718 | 0x06b6 | MC_MATCH_RESPONSE_CHARINFO_DETAIL | S2C | 265 | detailed char info reply |
 | 1719 | 0x06b7 | MC_MATCH_REQUEST_ACCOUNT_CHARINFO | C2S | 5 | ask for a slot's char info (param: slot) |
@@ -116,7 +118,33 @@ from this spec in a few dozen lines:
 | 1728 | 0x06c0 | *(UNIDENTIFIED)* | S2C | 12 | char reply |
 
 **Char-list order:** `1701` → `1702`. **Select:** `1703` → `1704` (+ `1719`→`1720` for the detail).
-**Create:** `1711` → `1712` → client re-lists (`1701`→`1702`).
+**Create:** `1711` → `1712` → client re-lists (`1701`→`1702`). **Delete:** `1713` → `1714` → client re-lists.
+
+### Decoded structure — `1711` CREATE_CHAR (C2S) / `1713` DELETE_CHAR (C2S) — byte-exact
+Both are keyed by the selected-account handle and a slot index; strings are `[u16 len][CP949 bytes]`
+(NUL-padded to `len`).
+```
+1711 REQUEST_CREATE_CHAR (44 params):
++0x00  u64   accountMUID         (the account handle; low = 0x00079d3b in the capture)
++0x08  u32   slotIndex           (target bottom-bar slot, e.g. 3)
++0x0C  u16   nameLen             (e.g. 14)
++0x0E  char  name[nameLen]       (new char name, NUL-terminated — e.g. "IWillEndThis")
++..    u32   appearance          (sex/costume selector, e.g. 0x00000162)
++..    byte  reserved[...]        (remaining appearance bytes, zero in the capture)
+
+1712 RESPONSE_CREATE_CHAR (20 params):  [u32 result=0][u16 nameLen][char name[]]   (echoes the new name)
+
+1713 REQUEST_DELETE_CHAR (21 params):
++0x00  u64   accountMUID         (low = 0x00079d3b)
++0x08  u32   slotIndex           (the char being deleted, e.g. 2)
++0x0C  u16   nameLen             (7)
++0x0E  char  name[nameLen]       (the char's own name, re-typed to confirm — e.g. "test5")
+
+1714 RESPONSE_DELETE_CHAR (8 params):   [u32 result=0][u32 deletedCharId]           (result 0 = success)
+```
+> Deletion is a **confirm-by-name** action: the client makes you re-type the exact character name, and sends
+> that string in `1713` alongside the slot. The server validates it matches the char in that slot before
+> deleting. `result=0` in `1714` = deleted; the client then re-requests `1701`→`1702` to refresh the bar.
 
 ### Decoded structure — `1702` char-list record (46 bytes each) — byte-exact, 3-char capture
 BlobArray payload = `u32 payloadLen | u32 elementSize=46 | u32 elementCount | record[0] | record[1] | ...`
@@ -254,6 +282,10 @@ Server applies the move, then replies `1836` (rebuilt char/item detail) so the i
 1825 REQUEST_TAKEOFF_ITEM (12 params):[u64 charMUID][u32 slot]                               (unequip by slot)
 1826 RESPONSE_TAKEOFF_ITEM (4 params):[u32 result=0]
 ```
+> **Profile picture / frame / icon changes use this same equip path.** Changing your profile image is just
+> `1823` equipping a *profile* item instance into its slot — observed slots **7** and **8** (profile
+> icon / frame) and **20** (profile background). There is no dedicated "set profile picture" command; each
+> change is one `1823`→`1824` with the chosen item's instance id and the profile slot number.
 
 **`1822` RESPONSE_CHARACTER_ITEMLIST layout (alt/legacy path, `phase26_parse1822.py`):**
 `[207-B header][ N × 29-B item record ][16-B trailer]`. Header = `[u32 @0 (varies: 0x44/0x5e/0x6c…)]`
@@ -280,10 +312,29 @@ Kept for reference (the record layout is genuine), but the retail Hideout grid r
 | 1213 | 0x04bd | MC_MATCH_CHANNEL_LIST | S2C | 176 | one page of channels |
 | 1221 | 0x04c5 | MC_MATCH_CHANNEL_REQUEST_PLAYER_LIST | C2S | 24 | ask who's in the channel |
 | 1222 | 0x04c6 | MC_MATCH_CHANNEL_RESPONSE_PLAYER_LIST | S2C | 606 | channel player list |
-| 1226 | 0x04ca | MC_MATCH_CHANNEL_CHAT | S2C | 65..90 | a chat line (sender + text) |
+| 1225 | 0x04c9 | MC_MATCH_CHANNEL_REQUEST_CHAT | C2S | 28 | **send** a channel chat line |
+| 1226 | 0x04ca | MC_MATCH_CHANNEL_CHAT | S2C | 65..90 | a chat line broadcast (sender + text) |
 | 1231 | 0x04cf | MC_MATCH_CHANNEL_RESPONSE_RULE | S2C | 16 | channel rule info |
 
-**Flow:** `1211`→`1213`(list) ; `1205`→`1207`(join) ; `1221`→`1222`(who) ; `1226`(chat).
+**Flow:** `1211`→`1213`(list) ; `1205`→`1207`(join) ; `1221`→`1222`(who) ; `1225`(send chat)→`1226`(broadcast).
+
+### Decoded structure — chat (byte-exact)
+```
+1225 REQUEST_CHANNEL_CHAT (C2S, 24 params):
++0x00  u64   charMUID        (low = 0x00079d3b)
++0x08  u32   chatType        (1)
++0x0C  u32   reserved (0)
++0x10  u16   textLen
++0x12  char  text[textLen]   (CP949, NUL-terminated — e.g. "easy")
+
+1226 CHANNEL_CHAT (S2C, ~62 params):
++0x00  u64   senderMUID
++0x08  u16   nameLen
++..    char  senderName[]    (e.g. "Czar")
++..    u16   textLen
++..    char  text[]          (CP949; Korean jamo etc. pass through as multi-byte)
+```
+Room/stage chat is the separate `1321 MC_MATCH_STAGE_CHAT` (C2S, §5): `[u64 charMUID][u16 len][text]`.
 
 ---
 
@@ -567,8 +618,72 @@ Because damage is a raw integer the victim applies unconditionally, the combat m
 | 2303 | 0x08ff | *(UNIDENTIFIED)* | S2C | 32 | notify |
 | 2307 | 0x0903 | *(UNIDENTIFIED)* | S2C | 24 | notify |
 | 9301 | 0x2455 | *(UNIDENTIFIED)* | S2C | 44 | very frequent broadcast (per-player tick?) |
-| 22002 | 0x55f2 | *(UNIDENTIFIED)* | S2C | 854 | large one-shot push (login-time table) |
+| 22002 | 0x55f2 | *(reward list — see §11)* | S2C | 854 | reward/event list push |
 | 22117 | 0x5665 | *(UNIDENTIFIED)* | S2C | 8 | notify |
+
+---
+
+## 10. Friends
+
+| id | hex | name | dir | body | what it does |
+|----|-----|------|-----|------|--------------|
+| 1901 | 0x076d | MC_MATCH_FRIEND_ADD | C2S | 16 | add a friend **by name** |
+| 1903 | 0x076f | MC_MATCH_FRIEND_LIST | C2S | 4 | request the friend list (param-less) |
+
+### Decoded structure — `1901` FRIEND_ADD (byte-exact)
+```
++0x00  u16   nameLen         (e.g. 10)
++0x02  char  name[nameLen]   (the account/char name to befriend, CP949 — e.g. "wyrelade")
+```
+Friends are added **by name string**, not by MUID. `1903` (list) is sent with no params; the server
+answers with the current friend roster.
+
+---
+
+## 11. Rewards, achievements & quest items (login gifts / event claims)
+
+The Steam client shows event-reward, achievement, and "quest item" panels. Each panel is **opened** with a
+tiny param-less `C2S` request and **filled** by a large `S2C` push carrying the reward text + the grantable
+items; a reward is **claimed** with a quest-item buy.
+
+| id | hex | name | dir | body | what it does |
+|----|-----|------|-----|------|--------------|
+| 19015 | 0x4a47 | *(reward list request)* | C2S | 4 | open a reward/event panel (param-less) |
+| 19012 | 0x4a44 | *(reward list)* | S2C | 854 | reward/event list + description text + grantable items |
+| 21997 | 0x55ed | *(reward list request)* | C2S | 4 | open a reward panel (param-less) |
+| 21998 | 0x55ee | *(reward list)* | S2C | 854 | reward list (same 854-B shape as 19012) |
+| 22001 | 0x55f1 | *(reward list request)* | C2S | 4 | open a reward panel (param-less) |
+| 22002 | 0x55f2 | *(reward list)* | S2C | 854 | reward list |
+| 22043 | 0x561b | *(reward list request)* | C2S | 4 | open a reward panel (param-less) |
+| 21000 | 0x5208 | MC_MATCH_REQUEST_CHAR_QUEST_ITEM_LIST | C2S | 12 | `[u64 charMUID]` — list this char's quest items |
+| 21001 | 0x5209 | MC_MATCH_RESPONSE_CHAR_QUEST_ITEM_LIST | S2C | 16 | quest-item list |
+| 21002 | 0x520a | MC_MATCH_REQUEST_BUY_QUEST_ITEM | C2S | 20 | **claim / redeem a quest (achievement/event) item** |
+| 21003 | 0x520b | MC_MATCH_RESPONSE_BUY_QUEST_ITEM | S2C | 20 | claim result (grants the item instance) |
+| 20965 | 0x51e5 | *(achievement claim)* | C2S | 20 | achievement-reward claim (secondary account MUID) |
+| 20984 | 0x51f8 | *(achievement result)* | S2C | 24 | achievement claim result (→ char MUID) |
+| 20985 | 0x51f9 | *(achievement claim)* | C2S | 12 | achievement claim step |
+| 20986 | 0x51fa | *(achievement result)* | S2C | 41 | achievement claim result |
+| 20987 | 0x51fb | *(achievement claim)* | C2S | 20 | achievement claim step |
+
+### Decoded structure — claiming a reward item (`21002` → `21003`)
+```
+21002 REQUEST_BUY_QUEST_ITEM (16 params):
++0x00  u64   charMUID        (low = 0x00079d3b)
++0x08  u32   questItemID     (the reward's catalog id — e.g. 0x00030d41)
++0x0C  u32   count           (1)
+
+21003 RESPONSE_BUY_QUEST_ITEM (16 params):
++0x00  u32   result=0
++0x04  u32   newInstanceId   (the granted owned-item instance, e.g. 0x00004cc8)
++0x08  byte  reserved[...]
+```
+> Flow observed: open panel (param-less `19015`/`21997`/`22001`/`22043` → 854-B list) → pick a reward →
+> `21002` with the item's `questItemID` → `21003 result=0` grants a fresh item instance, which then appears
+> in the account item list (`1832`) and can be brought to the character (`1833`) and equipped (`1823`).
+> Achievement rewards additionally use the `20965/20984/20985/20986/20987` cluster (a secondary account
+> MUID `…0x5a91…` appears in those requests). The 854-B reward push carries the human text seen in-game
+> (e.g. *"Wishlist Reward — … Gender-specific items will be provided based on your character's gender"* and
+> *"Thanks for Joining GunZ — … a special profile image to commemorate the moment"*).
 
 ---
 
@@ -577,7 +692,7 @@ These decode cleanly (valid MCommand framing) but aren't in the stock table — 
 Their byte layouts are in the corpus; meaning is inferred from when they appear:
 
 `1335, 1337, 1404, 1418, 1424, 1443, 1445, 1722, 1724, 1727, 1728, 1845, 1848, 1853, 1854, 1886, 1889,
-1890, 2303, 2307, 3200, 3202, 3203, 3204, 3206, 5004, 9301, 22002, 22117`
+1890, 2303, 2307, 3200, 3202, 3203, 3204, 3206, 5004, 9301, 22117`
 
 High-value ones to identify next: **1424** (per-player room state), **9301** (very frequent broadcast),
 **3200/3202** (Steam-state pair), **1335** (large room bulk).
