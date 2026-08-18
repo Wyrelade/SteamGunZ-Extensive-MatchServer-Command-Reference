@@ -134,6 +134,20 @@ BlobArray payload = `u32 elementSize=46 | u32 elementCount | record[0] | record[
 +0x3C u32 experience | +0x40 u32 bounty | 0x44.. stats / items / currencies / region (zero-fill)
 ```
 
+**Currency map (LIVE-VERIFIED, phase-26 W1).** The retail top bar shows three currencies: **C (Coin)**,
+**ZC**, **BT (Bounty)**.
+- **BT (Bounty)** IS the char-record currency = record **+0x40** (= DB `Character.BP`). Setting `BP` high
+  moved BT 0→nonzero live; it's the only shop currency the match server controls.
+- **C (Coin)** and **ZC** are **account-level** — NOT in the 542-B char record (a distinct-marker pass at
+  record +0x44/+0x48/+0x4C lit up NONE of the three), NOT in the shim `game_info.json`, NOT any DB column.
+  They read as client-cached account values (e.g. C=1025, ZC=95460) from the real Steam account and persist
+  until an account-currency command overrides them. Same bucket as the deferred nickname (phase-26 W0). To
+  max Coin/ZC we must identify + send that account-currency command (candidate unknown ids 1722/1724/1727/
+  1728/1845), not touch the char record. Shop premium packages are priced in **Coin** (e.g. 1800) → Coin
+  gates "afford anything"; regular Credits-tab items are affordable at the cached ZC.
+- Record +0x44/+0x48/+0x4C are pinned to dev-max as a harmless hedge (any detail panel that reads them shows
+  max); +0x50 stays zero (ts/uid, not money).
+
 ---
 
 ## 3. Shop & items
@@ -148,7 +162,30 @@ BlobArray payload = `u32 elementSize=46 | u32 elementCount | record[0] | record[
 | 21000 | 0x5208 | MC_MATCH_REQUEST_CHAR_QUEST_ITEM_LIST | C2S | 12 | quest-item list request |
 | 21001 | 0x5209 | MC_MATCH_RESPONSE_CHAR_QUEST_ITEM_LIST | S2C | 16 | quest-item list reply |
 
-**Buy:** `1811` → `1812`. **Equip:** `1823` → `1824`. Inventory arrives as `1822`.
+**Buy:** `1811` → `1812`. **Equip:** `1823` → `1824`. Inventory arrives as `1822` (server pushes it
+unsolicited — the client never sends `1821`).
+
+**`1811` REQUEST_BUY_ITEM body (24 params B), 5 real samples decoded as BE u32:**
+`[w0 qty/low][w1 item-token …0101][w2 …02][w3 …02/9602][w4 …03/9603][w5 0]`. w1 is a per-shop-slot token
+(low 2 bytes const `0101`), NOT a raw catalog itemID → mapping slot→itemID needs the retail shop catalog
+(client `system.mrs`). Dev sandbox ignores cost.
+**`1812` RESPONSE_BUY_ITEM (7 params B):** `[u32 result=0][3 echo bytes = 1811 body[4:7]]`. IMPLEMENTED
+(phase-26 W2: raw-blob 1811 → exact 1812 success).
+**`1824` RESPONSE_EQUIP_ITEM (3 params B):** `00 00 00` (result=0). IMPLEMENTED (raw-blob 1823 → 1824).
+
+**`1822` RESPONSE_CHARACTER_ITEMLIST layout (CRACKED, `phase26_parse1822.py`):**
+`[207-B header][ N × 29-B item record ][16-B trailer]`. Header = `[u32 @0 (varies: 0x44/0x5e/0x6c…)]`
+`[const `00 00 00 b8 00 00 00 08 00 00 00 16` @4]` `[3-B pad]` `[equip-slot MUID table: MMCIP_END(12)`
+`slots × (u32 instLow + u32 instHigh=0), 0=empty]` `[zeros/fields]`. Each 29-B record:
+```
++0x00 u32 itemInstanceID   +0x04 u32 instHigh(=0)   +0x08 u32 itemID (retail catalog)
++0x0C u32 rentMinRemainder (0x80520 = 525600 = RENT_MINUTE_PERIOD_UNLIMITED = PERMANENT; smaller = rental)
++0x10 u32 fB (0x48 rental / 0 permanent)   +0x14 u32 count   +0x18 u32 expiryTs (0 = permanent)   +0x1C u8 0
+```
+37 real retail itemIDs mined (weapons/armor): `0x30d401 0x30d400 0x2f9b81 0x2f74a4 0x1e8480 0x602160 …`.
+The 207-B header is a custom hand-packed blob (not a stock BlobArray) — reconstruct/validate it with the
+`gunzemu_gui.py` injector (inject candidate 1822s at the live client, no rebuild) before baking into the
+`ResponseCharacterItemList` MASANG path. That builder is where W3 inventory + equip-persistence land.
 
 ---
 
@@ -360,6 +397,77 @@ or an HP value:
 - **Direction is asymmetric under relay.** Outbound, the client sends only `5082` (its own muxed state) to
   the agent; inbound, the agent forwards every *other* peer's typed events (`15003/4/7/19…`). So the damage
   you **take** arrives as `15019`; the damage you **deal** is resolved on the victim's side from your shot.
+
+### `5082` is a relay envelope — the outbound peer commands live *inside* it
+The `5082` broadcast is **not a leaf command**. It is a **relay envelope** that tunnels one or more **nested
+MCommands** to the relay agent (`…:7778`), sent **once per destination peer**. The client keeps the stock
+MAIET **10000-range `MC_PEER_*` command ids**; the agent re-numbers them into the `15xxx` range when it
+forwards them to other peers (a per-id lookup, *not* a fixed offset — e.g. `10032 → 15019`, `10012 →
+15003`). So the outbound half of every fight — the shots, melee swings, and damage **you deal** — is carried
+here, nested, and was previously seen only as the opaque `5082` blob.
+
+```
+5082 body:
++0x00  f32   header         (constant marker)
++0x04  u32   senderUID      (our peer uid, e.g. 0x00251bcc)
++0x08  u32   reserved (0)
++0x0C  u32   destPeerUID    (recipient; one 5082 is emitted per peer)
++0x10  u32   reserved (0)
++0x14  u32   blockLen       (byte length of the nested-command region)
++0x18  u32   seq
++0x1C  u32   nCmds          (count of nested MCommands that follow)
++0x20  ...   nested MCommands, each: [u16 nDataCount][u16 innerID][payload]
+                             (nDataCount = 4 + payload length)
+```
+
+**Nested peer commands (C2S, wire-confirmed; names from the MAIET/OpenGunZ stock table):**
+
+| id | hex | name | body | layout |
+|----|-----|------|------|--------|
+| 10012 | 0x271c | MC_PEER_BASICINFO | 35 | position / velocity / state |
+| 10014 | 0x271e | MC_PEER_HPAPINFO | 8 | `[f32 hp][f32 ap]` |
+| 10022 | 0x2726 | MC_PEER_CHANGE_WEAPON | 4 | `[u32 slot]` |
+| 10032 | 0x2730 | MC_PEER_DAMAGE | 12 | `[u32 victimUID.Low][u32 victimUID.High][u32 damage]` |
+| 10033 | 0x2731 | MC_PEER_RELOAD | 0 | — |
+| 10034 | 0x2732 | MC_PEER_SHOT | 17 | packed shot info (origin / direction / sel) |
+| 10037 | 0x2735 | MC_PEER_SHOT_MELEE | 20 | `[f32 shotTime][f32 x][f32 y][f32 z][u32 nShot]` |
+| 10045 | 0x273d | MC_PEER_DASH | 15 | dash vector |
+| 10041 | 0x2739 | MC_PEER_DIE | 8 | `[u32 UID.Low][u32 UID.High]` |
+| 10001 / 10002 | 0x2711 / 0x2712 | MC_PEER_PING / PONG | 12 | clock sync |
+
+### Decoded structure — `MC_PEER_SHOT_MELEE` / sword swing (`0x2735`, 20-byte body)
+```
++0x00  f32   shotTime       (game time in seconds; increases across the match)
++0x04  f32   posX           ) attacker world position at the swing
++0x08  f32   posY           )
++0x0C  f32   posZ           )
++0x10  u32   nShot          (combo/swing index: 0,1,2…)
+```
+This command carries the **swing animation only** — it deals no damage on its own.
+
+### Decoded structure — `MC_PEER_DAMAGE` / the hit that lands (`0x2730`, 12-byte body)
+```
++0x00  u32   victimUID.Low  ) target peer MUID
++0x04  u32   victimUID.High )
++0x08  u32   damage         (raw magnitude: sword 30, primary 13, headshot 69/80)
+```
+The attacker sends this **directly to the victim**, whose client runs `OnDamage(sender, victim, damage)` and
+subtracts HP from its **own local simulation** — with no server validation and no hit-geometry check. The
+match server (`:6000`) sees only the post-hoc `1511 KILL` → `1512 DEAD`.
+
+### Exploitation — turning peer-authoritative damage to advantage
+Because damage is a raw integer the victim applies unconditionally, the combat model is directly abusable:
+- **One-shot / burst kill.** Emit `MC_PEER_DAMAGE` = `[victimUID.Low][victimUID.High][100]` (or the target's
+  full HP) at a peer → instant death. Repeat at 60–100 Hz for continuous "slash-spam" pressure independent of
+  range or aim. Pair it with a genuine `MC_PEER_SHOT_MELEE` so the swing looks legitimate.
+- **No line-of-sight or range required.** `MC_PEER_DAMAGE` carries no origin, direction, or hit geometry — the
+  victim has nothing to validate against and cannot reject it. Any peer UID from the room roster
+  (`1462 RESPONSE_PEERLIST`) is a valid target.
+- **Sender is the envelope, not the payload.** `OnDamage` trusts `pCommand->GetSenderUID()` — the `5082`
+  `senderUID` / relay session — so hits can be attributed at will.
+- **Delivery.** Craft the nested record, wrap it in the `5082` envelope, and send it UDP from `:7727` to the
+  relay agent `:7778` (or directly to a peer `:76xx` when NAT is open). The mesh is plaintext (`nMsg = 0x64`),
+  so no crypto is involved.
 
 ---
 
