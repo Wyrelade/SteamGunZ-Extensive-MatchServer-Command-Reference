@@ -172,11 +172,14 @@ prefixed with the result word). Record head:
 Deeper in the SAME record (our packer historically **zeroes** these — they must be filled for appearance +
 select-commit):
 ```
-≈+0x7C u32  equippedItemID[12]   (one per MMCIP equip slot — the appearance ids; e.g. 0x2f4d63, 0x2f7479,
-                                  0x2fc2a1, 0x2f9bc7, 0x2fe9cf, 0x30d400, 0x30d401, 0x1e8480, 0x1f6ee0,
-                                  0x1fe414, 0x2191c3, 0x2191c4)
-≈+0xD8 u32  colorOrClanMuid[3]   (e.g. 0x5d6241, 0x5d1423, 0x5d3b31)
++0x7E  u32  equippedItemID[12]   (appearance ids, SLOT ORDER: head,chest,hands,legs,feet,fingerL,fingerR,
+                                  melee,range,range2,custom,custom2 = 0x2f4d63,0x2f7479,0x2fc2a1,0x2f9bc7,
+                                  0x2fe9cf,0x30d400,0x30d401,0x1e8480,0x1f6ee0,0x1fe414,0x2191c3,0x2191c4)
++0xCA  u32  colorOrClanMuid[3]   (e.g. 0x5d6241, 0x5d1423, 0x5d3b31)
++0xDE  u32  0xFFFFFFFF           (end marker)
 ```
+(Offsets EXACT, J62: record base = 1720 params+0x0D / 1704 params+0x10; first appearance id lands at
+params 0x8B = record +0x7E. Earlier "≈+0x7C/≈+0xD8" were approximate.)
 `1704` additionally carries, after the record, an **equipped-instance MUID array** — the *instance* ids of
 the currently-worn items (e.g. `0x00104f55 / 5a / 5b / 5c`), i.e. the specific stash items that are equipped
 (these instance ids come from the `1832` account list and the `1833` bring-to-char moves).
@@ -184,7 +187,7 @@ the currently-worn items (e.g. `0x00104f55 / 5a / 5b / 5c`), i.e. the specific s
 **Top-right banner source (proven).** Switching characters sends `1719 [u8 slotIndex]` → `1720` with that
 slot's 542-record, and the banner's **name + level + EXP** track the switched character exactly (verified
 across 4 chars: slot 0 / lvl 8, slots 1–3 / lvl 1). So the banner is fed by this **542-record** (name @
-`+0x00`, slotIndex @ `+0x37`, level @ `+0x38`, exp @ `+0x3C`) via `1720`/`1704` — **not** by `1804`
+`+0x00`, slotIndex @ `+0x36`, level @ `+0x37` [u16], exp @ `+0x3C`) via `1720`/`1704` — **not** by `1804`
 (which carries level/exp/currency but no name) and **not** by any account/EOS display-name. An emulator whose
 542-record is zeroed or mis-framed shows a blank name / Lv.0 banner.
 
@@ -201,6 +204,20 @@ across 4 chars: slot 0 / lvl 8, slots 1–3 / lvl 1). So the banner is fed by th
   gates "afford anything"; regular Credits-tab items are affordable at the cached ZC.
 - Record +0x44/+0x48/+0x4C are pinned to dev-max as a harmless hedge (any detail panel that reads them shows
   max); +0x50 stays zero (ts/uid, not money).
+
+### Decoded structure — `1804` RESPONSE_MY_SIMPLE_CHARINFO — byte-exact (J62)
+Wire = a **BlobArray** `[u32 total=0x35=53][u32 elemSize=0x2d=45][u32 count=1]` + a **45-byte record**
+(paramlen 57). The record carries level/XP/BP but **no name** (so it's NOT the banner source):
+```
++0x00  u8    level          (real 0x08 = Lv8)
++0x01  u32   XP             (real 0x000025e7 = 9703)
++0x05  u32   BP / bounty    (real 0x000061ea = 25066)
++0x09..0x2C  account currencies (Coin/ZC) + a ts (~+0x16 = 0x6a84add5, matches the 1704 ts) — offsets fuzzy
+```
+> ⚠️ Emit as a real `MMakeBlobArray(45,1)` blob, NOT a hand-rolled 56-B blob. The earlier packer put level at
+> byte 0x0B (off-by-one vs record+0x00) with the header wrong-endian and flooded XP/BP with 0x3B → any UI
+> reading level/XP from 1804 saw garbage/0. Correct = level@+0, XP@+1, BP@+5; flood only +0x09..+0x2C (0x3B)
+> for currency affordability.
 
 ---
 
@@ -260,27 +277,27 @@ params:
 ```
 Server applies the move, then replies `1836` (rebuilt char/item detail) so the item shows on the character.
 
-### Decoded structure — `1811` REQUEST_BUY_ITEM (25 params B, real)
+### Decoded structure — `1811` REQUEST_BUY_ITEM (24-B body) — **selector CRACKED (J62c, live)**
+The buy carries a **shop selector = the GShop `SHOP_ITEM.ID`**, encoded as a **LITTLE-ENDIAN u32 at body
+OFFSET 3** (NOT +4 — the capture tool's +0x04 was a 1-byte-shifted read, same off-by-one seen in the 1720
+dumps). `itemID = SHOP_ITEM.ID / 10` (the GShop ID→ITEM_ID rule; holds for 2976/3010 rows, 34 exceptions =
+rare 91xxxxxx cash items). **Verified on 9 live buys, 9/9 map to valid GShop ids.**
 ```
-+0x00  u32   0
-+0x04  u32   shopSelector    (e.g. 0x01d905ca — a shop-slot token, NOT a raw catalog itemID)
-+0x08  u32   1
-+0x0C  u32   2
-+0x10  u32   0x22000002      (category/filter word)
-+0x14  u32   3
-+0x18  u8    0
++0x03  u32(LE)  shopId = GShop SHOP_ITEM.ID       (e.g. 20000000, 20000020, 21000030)  -> itemID = shopId/10
+   ...rest = constant category/filter words ([4:6] carries a category marker: daggers 0x312d, etc.)
 ```
-`shopSelector` maps to a catalog `itemID` via the retail **`GShop.xml`** `SHOP_ITEM.ID → ITEM_ID` table
-(client `system.mrs`); the match server never sends a shop catalog. Dev sandbox ignores cost.
+Live examples: `shopId 20000000→item 2000000`, `20000020→2000002`, `21000030→2100003`.
+Server (`MMatchServer_OnCommand.cpp` 1811 handler): parse offset-3 LE u32 → `itemID = shopId/10` →
+`InsertCharItem`. The match server never sends a shop catalog (client renders it from its own `system.mrs`).
+Dev sandbox ignores cost.
 
-### Decoded structure — `1812` RESPONSE_BUY_ITEM (~1316 params B, real)
-```
-+0x00  u32   result=0
-+0x04  u32   echo            (= the 1811 shopSelector)
-+0x08  ...   the rebuilt owned-item list (~1300 B) bundled straight into the buy response
-```
-> The buy response is **not** a bare 7-byte ack (the earlier corpus guess) — retail bundles the updated item
-> list into `1812`, so after a purchase the client refreshes inventory from this one response.
+### Decoded structure — `1812` RESPONSE_BUY_ITEM — **bare params (J62c)**
+Real 1812 = **BARE** params (no outer length prefix): `[int result=0][int echo=shopId][blob item-list]`
+(paramlen 1316; the ~1300-B list body is ENCRYPTED in the capture, unreplicable). Emit as an INT + INT + a
+16-B account-item blob (the format the client parses for 1832) so the bought item renders.
+> ⚠️ A raw `MPT_BLOB` response is WRONG: it serializes as `[u32 len][data]` (length-prefixed); the client
+> reads 1812/1824 as bare ints, takes the length prefix AS the result (=fail), and desyncs the next command.
+> **All Masang bare-int responses must be emitted as `MPT_INT`, never a raw blob.**
 
 ### Decoded structure — `1823` / `1825` equip / unequip
 ```
@@ -295,9 +312,14 @@ Server applies the move, then replies `1836` (rebuilt char/item detail) so the i
 > change is one `1823`→`1824` with the chosen item's instance id and the profile slot number.
 
 **`1822` RESPONSE_CHARACTER_ITEMLIST layout (alt/legacy path, `phase26_parse1822.py`):**
-`[207-B header][ N × 29-B item record ][16-B trailer]`. Header = `[u32 @0 (varies: 0x44/0x5e/0x6c…)]`
-`[const `00 00 00 b8 00 00 00 08 00 00 00 16` @4]` `[3-B pad]` `[equip-slot MUID table: MMCIP_END(12)`
-`slots × (u32 instLow + u32 instHigh=0), 0=empty]` `[zeros/fields]`. Each 29-B record:
+`[int Bounty][4 pad bytes=0][blob Equip(elem=8,count=22)][blob Items(elem=29,countN)][blob Rented(elem=24,
+count=0)][int tail=0]`. The **equip section = 22 slots** (NOT MMCIP_END=12), each an 8-byte MUID
+`[u32 CIID_low][u32 0]`, `0`=empty. Decoded worn layout (J62, real 1822 seq 11891): **slots 0..11 = the 12
+worn items IN APPEARANCE ORDER** (head,chest,hands,legs,feet,fingerL,fingerR,melee,range,range2,custom,
+custom2 — same order as the 542-record `+0x7E` array), slots 12..18 empty, slots 19..21 = profile items.
+To dress the inventory paper-doll: for slot i in 0..11, put the owned CIID whose ItemID == the appearance
+id for that slot (fill only if owned → no crash; a mismatched CIID in the wrong slot CRASHES the client).
+Each 29-B item record:
 ```
 +0x00 u32 itemInstanceID   +0x04 u32 instHigh(=0)   +0x08 u32 itemID (retail catalog)
 +0x0C u32 rentMinRemainder (0x80520 = 525600 = RENT_MINUTE_PERIOD_UNLIMITED = PERMANENT; smaller = rental)
